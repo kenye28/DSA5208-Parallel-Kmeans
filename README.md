@@ -1,7 +1,5 @@
 # DSA5208 Project 3 — Parallel K-means (Atlas8 + Vanda)
 
-**GitHub repository:** https://github.com/kenye28/DSA5208-Parallel-Kmeans
-
 ## What is included
 
 - **Source code:** serial C++, MPI, hybrid MPI/OpenMP on both HPC systems, plus Vanda CUDA.
