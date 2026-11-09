@@ -1,0 +1,36 @@
+#!/bin/bash
+#PBS -N km_serialN
+#PBS -q parallel
+#PBS -l walltime=00:25:00
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Submit with qsub from the project root}"
+source scripts/atlas8_env.sh
+
+[[ -x bin/serial ]] || { echo 'ERROR: bin/serial not found: compile first' >&2; exit 1; }
+OUTDIR="results/atlas8/serial_sweep/${PBS_JOBID%%.*}"
+mkdir -p "$OUTDIR"
+{
+  echo "job_id=${PBS_JOBID}"
+  echo "host=$(hostname)"
+  echo "pbs_nodefile=${PBS_NODEFILE:-unknown}"
+  date -Is
+  lscpu | grep -E '^CPU\(s\)|^Socket\(s\)|^Core\(s\) per socket|^Model name' || true
+} > "$OUTDIR/run_metadata.txt"
+
+# Five measured repetitions per size, plus one unrecorded warm-up.
+# Same K, D, iterations, seed as the strong-scaling baseline.
+for N in 500000 1000000 2000000 4000000 8000000 16000000; do
+  ARGS=(--points "$N" --clusters 8 --dims 8 --iterations 20 --seed 1234)
+  LOG="$OUTDIR/serial_N${N}.log"
+  echo "=== Serial N=$N warm-up ==="
+  ./bin/serial "${ARGS[@]}" > /dev/null
+  for rep in 1 2 3 4 5; do
+    echo "=== Serial N=$N measurement $rep ==="
+    ./bin/serial "${ARGS[@]}" | tee -a "$LOG"
+  done
+done
+python3 scripts/parse_results.py "$OUTDIR"/serial_N*.log > "$OUTDIR/results.csv"
+python3 scripts/summarize_csv.py "$OUTDIR/results.csv"
+echo "Saved: $OUTDIR/results.csv"

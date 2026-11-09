@@ -1,0 +1,78 @@
+#!/bin/bash
+#PBS -N km_compare12
+#PBS -q parallel
+#PBS -l select=1:ncpus=12:mpiprocs=12:mem=8gb
+#PBS -l walltime=00:40:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR:?Submit using qsub}"
+source scripts/atlas8_env.sh
+
+OUTDIR="results/atlas8/compare12/${PBS_JOBID%%.*}"
+mkdir -p "$OUTDIR"
+
+ARGS=(--points 2000000 --clusters 8 --dims 8 \
+      --iterations 20 --seed 1234)
+
+labels=(serial mpi12 hyb6x2 hyb3x4 omp1x12)
+
+for label in "${labels[@]}"; do
+    : > "$OUTDIR/$label.log"
+done
+
+run_case() {
+    local label="$1" rep="$2" threads=1
+    local -a cmd
+
+    case "$label" in
+        serial)
+            cmd=(./bin/serial)
+            ;;
+        mpi12)
+            cmd=(mpiexec --map-by slot --bind-to core \
+                 -np 12 ./bin/mpi)
+            ;;
+        hyb6x2)
+            threads=2
+            cmd=(mpiexec --map-by slot:PE=2 --bind-to core \
+                 -np 6 ./bin/mpi_openmp)
+            ;;
+        hyb3x4)
+            threads=4
+            cmd=(mpiexec --map-by slot:PE=4 --bind-to core \
+                 -np 3 ./bin/mpi_openmp)
+            ;;
+        omp1x12)
+            threads=12
+            cmd=(mpiexec --map-by slot:PE=12 --bind-to core \
+                 -np 1 ./bin/mpi_openmp)
+            ;;
+    esac
+
+    echo "$label repetition=$rep (0=warmup)"
+
+    if (( rep == 0 )); then
+        OMP_NUM_THREADS="$threads" OMP_DYNAMIC=FALSE \
+        OMP_PLACES=cores OMP_PROC_BIND=close \
+        "${cmd[@]}" "${ARGS[@]}" > /dev/null
+    else
+        OMP_NUM_THREADS="$threads" OMP_DYNAMIC=FALSE \
+        OMP_PLACES=cores OMP_PROC_BIND=close \
+        "${cmd[@]}" "${ARGS[@]}" | tee -a "$OUTDIR/$label.log"
+    fi
+}
+
+# Rotate configuration order between repetitions
+for rep in 0 1 2 3 4 5; do
+    for offset in 0 1 2 3 4; do
+        idx=$(((rep + offset) % 5))
+        run_case "${labels[idx]}" "$rep"
+    done
+done
+
+python3 scripts/parse_results.py \
+    "$OUTDIR"/*.log > "$OUTDIR/results.csv"
+
+echo "Saved results: $OUTDIR/results.csv"

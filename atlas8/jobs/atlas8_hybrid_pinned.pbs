@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N km_hybpin
+#PBS -q parallel
+#PBS -l select=1:ncpus=12:mpiprocs=2:ompthreads=2:mem=8gb
+#PBS -l walltime=00:20:00
+#PBS -j oe
+# If PBS requires a project code, add: #PBS -P YOUR_ALLOCATED_PROJECT
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Must run through qsub}"
+source scripts/atlas8_env.sh
+module list
+printf 'Job ID: %s\nHost: %s\n' "${PBS_JOBID:-unknown}" "$(hostname)"
+export OMP_NUM_THREADS=2 OMP_DYNAMIC=FALSE
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+args=(--points "${N:-2000000}" --clusters "${K:-8}" --dims "${D:-8}" --iterations "${ITERS:-20}" --seed "${SEED:-1234}")
+for rep in 0 1 2 3 4 5; do
+  if ((rep==0)); then echo 'WARMUP (exclude from analysis)'; else echo "MEASUREMENT $rep"; fi
+  # --bind-to none is a conservative first smoke-test choice: allow both OpenMP
+  # threads per rank to schedule on the 4 allocated CPUs. Tune binding later.
+  mpiexec --map-by slot:PE=2 --bind-to core \
+  -np 2 ./bin/mpi_openmp "${args[@]}"
+done

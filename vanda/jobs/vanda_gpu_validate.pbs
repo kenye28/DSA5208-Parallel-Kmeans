@@ -1,0 +1,79 @@
+#!/bin/bash -l
+#PBS -N km_gpu_valid
+#PBS -q auto
+#PBS -P personal-zhengkai.ye
+#PBS -l select=1:ncpus=4:ngpus=1:mem=8gb
+#PBS -l walltime=00:15:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+module load gcc/13.1.0
+module load cuda12.4/toolkit/12.4.1
+
+OUTDIR="results/vanda/gpu_validation/${PBS_JOBID%%.*}"
+mkdir -p "$OUTDIR"
+
+echo "=== GPU hardware ==="
+hostname
+nvidia-smi -L
+
+echo "=== CPU reference ==="
+./bin/serial \
+  --points 200000 \
+  --clusters 8 \
+  --dims 8 \
+  --iterations 20 \
+  --seed 1234 | tee "$OUTDIR/serial.log"
+
+echo "=== CUDA implementation ==="
+./bin/kmeans_cuda \
+  --points 200000 \
+  --clusters 8 \
+  --dims 8 \
+  --iterations 20 \
+  --seed 1234 | tee "$OUTDIR/cuda.log"
+
+echo "=== Correctness comparison ==="
+
+python3 - "$OUTDIR/serial.log" "$OUTDIR/cuda.log" <<'PY'
+import sys
+import math
+
+def read_result(path):
+    with open(path) as f:
+        lines = [x.strip() for x in f if x.startswith("RESULT ")]
+    if len(lines) != 1:
+        raise RuntimeError("Expected exactly one RESULT in " + path)
+    return dict(field.split("=", 1) for field in lines[0].split()[1:])
+
+cpu = read_result(sys.argv[1])
+gpu = read_result(sys.argv[2])
+
+for key in ("points", "clusters", "dims", "iterations"):
+    assert cpu[key] == gpu[key], "Parameter mismatch: " + key
+
+assert gpu["variant"] == "cuda", "CUDA variant missing"
+assert float(cpu["accuracy"]) >= 0.999999
+assert float(gpu["accuracy"]) >= 0.999999
+assert cpu["assignment_hash"] == gpu["assignment_hash"], \
+    "Assignment hashes differ"
+
+assert math.isclose(
+    float(cpu["inertia"]),
+    float(gpu["inertia"]),
+    rel_tol=1e-6,
+    abs_tol=1e-4
+), "Inertia mismatch"
+
+print("VALIDATION PASSED")
+print("CPU inertia:", cpu["inertia"])
+print("GPU inertia:", gpu["inertia"])
+print("Assignment hash:", gpu["assignment_hash"])
+print("CPU runtime:", cpu["time_s"], "s")
+print("GPU kernel runtime:", gpu["time_s"], "s")
+PY
+
+echo "=== GPU validation completed successfully ==="

@@ -1,0 +1,92 @@
+#!/bin/bash -l
+#PBS -N km_weak_small
+#PBS -q auto
+#PBS -P personal-zhengkai.ye
+#PBS -l select=1:ncpus=12:mpiprocs=12:mem=16gb
+#PBS -l walltime=00:30:00
+#PBS -j oe
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+module load gcc/13.1.0
+module load openmpi/gcc/64/4.1.8
+
+RANKS="${RANKS:?Submit using qsub -v RANKS=4 (or 8, 12)}"
+case "$RANKS" in
+  4|8|12) ;;
+  *) echo "ERROR: RANKS must be 4, 8, or 12" >&2; exit 1 ;;
+esac
+POINTS=$((800000 * RANKS))
+MPI_PREFIX=/cm/shared/apps/openmpi4/gcc/4.1.8
+OUTDIR="results/vanda/weak_scaling/${RANKS}_${PBS_JOBID%%.*}"
+mkdir -p "$OUTDIR"
+HOSTFILE="$OUTDIR/hosts.txt"
+sort "$PBS_NODEFILE" | uniq -c | awk '{print $2 " slots=" $1}' > "$HOSTFILE"
+
+if [[ $(wc -l < "$PBS_NODEFILE") -ne 12 || $(wc -l < "$HOSTFILE") -ne 1 ]]; then
+  echo "ERROR: Expected 12 allocated MPI slots on one compute node" >&2
+  exit 1
+fi
+
+echo "=== Configuration ==="
+echo "MPI ranks: $RANKS; points: $POINTS; job: $PBS_JOBID"
+cat "$HOSTFILE"
+echo "=== MPI rank placement ==="
+mpiexec --prefix "$MPI_PREFIX" -np "$RANKS" --hostfile "$HOSTFILE" \
+  --map-by "ppr:${RANKS}:node" --bind-to core hostname \
+  | sort | uniq -c | tee "$OUTDIR/rank_placement.txt"
+
+ARGS=(--points "$POINTS" --clusters 8 --dims 8 --iterations 20 --seed 1234)
+run_mpi() {
+  mpiexec --prefix "$MPI_PREFIX" -np "$RANKS" --hostfile "$HOSTFILE" \
+    --map-by "ppr:${RANKS}:node" --bind-to core ./bin/mpi "${ARGS[@]}"
+}
+
+echo "=== Warm-up (not measured) ==="
+run_mpi > "$OUTDIR/warmup.log" 2>&1
+
+echo "=== Five timed repetitions ==="
+for rep in 1 2 3 4 5; do
+  echo "Measurement $rep"
+  run_mpi 2>&1 | tee "$OUTDIR/rep_${rep}.log"
+done
+
+python3 - "$OUTDIR" "$RANKS" "$POINTS" <<'PY'
+import csv
+import pathlib
+import statistics
+import sys
+out = pathlib.Path(sys.argv[1])
+ranks = sys.argv[2]
+points = sys.argv[3]
+fields = ["variant", "points", "clusters", "dims", "iterations", "ranks",
+          "threads", "time_s", "communication_s", "inertia", "accuracy", "assignment_hash"]
+rows = []
+for rep in range(1, 6):
+    filename = out / ("rep_{}.log".format(rep))
+    matches = [line for line in filename.read_text(errors="replace").splitlines()
+               if line.startswith("RESULT ")]
+    if len(matches) != 1:
+        raise RuntimeError("Expected one RESULT in {}, found {}".format(filename, len(matches)))
+    values = dict(part.split("=", 1) for part in matches[0].split()[1:])
+    if (values.get("variant") != "mpi" or values.get("ranks") != ranks or
+            values.get("points") != points or values.get("clusters") != "8" or
+            values.get("dims") != "8" or values.get("iterations") != "20" or
+            float(values.get("accuracy", "0")) < 0.999999):
+        raise RuntimeError("Invalid result in {}".format(filename))
+    rows.append({"source": str(filename), **values})
+if len({row["assignment_hash"] for row in rows}) != 1:
+    raise RuntimeError("Assignment hashes differ between repetitions")
+with (out / "results.csv").open("w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["source"] + fields)
+    writer.writeheader()
+    writer.writerows(rows)
+times = [float(row["time_s"]) for row in rows]
+comms = [float(row["communication_s"]) for row in rows]
+print("VALIDATION PASSED: five runs with matching assignment hashes")
+print("Median runtime: {:.6f} s".format(statistics.median(times)))
+print("Min/max runtime: {:.6f}/{:.6f} s".format(min(times), max(times)))
+print("MPI reduction fraction: {:.2f}%".format(
+    100 * statistics.median(comms) / statistics.median(times)))
+print("Saved:", out / "results.csv")
+PY

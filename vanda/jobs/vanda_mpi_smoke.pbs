@@ -1,0 +1,32 @@
+#!/bin/bash -l
+#PBS -N km_mpi_test
+#PBS -q auto
+#PBS -P personal-zhengkai.ye
+#PBS -l select=1:ncpus=2:mpiprocs=2:mem=4gb
+#PBS -l walltime=00:10:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+module load gcc/13.1.0
+module load openmpi/gcc/64/4.1.8
+
+echo "=== Compute node ==="
+hostname
+
+echo "=== MPI version ==="
+mpiexec --version
+
+echo "=== Running MPI K-means ==="
+
+mpiexec -np 2 --bind-to core \
+  ./bin/mpi \
+  --points 200000 \
+  --clusters 8 \
+  --dims 8 \
+  --iterations 20 \
+  --seed 1234
+
+echo "=== MPI test completed ==="

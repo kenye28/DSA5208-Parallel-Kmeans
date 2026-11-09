@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -N km_validate
+#PBS -q parallel
+#PBS -l select=1:ncpus=12:mpiprocs=2:ompthreads=2:mem=8gb
+#PBS -l walltime=00:15:00
+#PBS -j oe
+# If PBS requires a project code, add: #PBS -P YOUR_ALLOCATED_PROJECT
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Must run through qsub}"
+source scripts/atlas8_env.sh
+module list
+printf 'Job ID: %s\nHost: %s\n' "${PBS_JOBID:-unknown}" "$(hostname)"
+printf 'MPI launcher: %s\n' "$(command -v mpiexec)"
+mkdir -p results
+bash scripts/validate.sh

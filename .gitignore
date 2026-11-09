@@ -1,0 +1,42 @@
+# Generated executables and build products
+**/bin/
+*.o
+*.so
+*.a
+
+# Scheduler output and logs (keep benchmark CSV files)
+*.log
+*.o[0-9]*
+*.e[0-9]*
+**/hosts.txt
+**/topology.txt
+**/affinity.txt
+
+# LaTeX intermediates and locally compiled report
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+Kmeans_Final_Report.pdf
+
+# Python and OS/editor artifacts
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+.DS_Store
+
+# Benchmark data and results
+atlas8/data/
+atlas8/results/
+vanda/results/
+
+# Generated files
+.DS_Store
+*.log
+*.o
+*.out
+bin/

@@ -1,0 +1,177 @@
+#!/bin/bash -l
+#PBS -N km_weak_ctrl
+#PBS -q auto
+#PBS -P personal-zhengkai.ye
+#PBS -l select=1:ncpus=12:mpiprocs=12:mem=16gb
+#PBS -l walltime=00:30:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+module load gcc/13.1.0
+module load openmpi/gcc/64/4.1.8
+
+MPI_PREFIX=/cm/shared/apps/openmpi4/gcc/4.1.8
+
+OUTDIR="results/vanda/weak_controlled/${PBS_JOBID%%.*}"
+mkdir -p "$OUTDIR"
+
+HOSTFILE="$OUTDIR/hosts.txt"
+
+sort "$PBS_NODEFILE" | uniq -c | \
+  awk '{print $2 " slots=" $1}' > "$HOSTFILE"
+
+if [[ $(wc -l < "$PBS_NODEFILE") -ne 12 ||
+      $(wc -l < "$HOSTFILE") -ne 1 ]]; then
+    echo "ERROR: Expected 12 slots on one node"
+    exit 1
+fi
+
+echo "=== Hardware ==="
+hostname
+lscpu | grep -E 'Model name:|Core.s. per socket:|Socket.s.:|Thread.s. per core:'
+
+echo "=== Allocation ==="
+cat "$HOSTFILE"
+
+run_mpi() {
+    local RANKS="$1"
+    local POINTS=$((800000 * RANKS))
+
+    mpiexec --prefix "$MPI_PREFIX" \
+      -np "$RANKS" \
+      --hostfile "$HOSTFILE" \
+      --map-by "ppr:${RANKS}:node" \
+      --bind-to core \
+      ./bin/mpi \
+      --points "$POINTS" \
+      --clusters 8 \
+      --dims 8 \
+      --iterations 20 \
+      --seed 1234
+}
+
+echo "=== Verify rank binding ==="
+
+for RANKS in 4 8 12; do
+    mpiexec --prefix "$MPI_PREFIX" \
+      -np "$RANKS" \
+      --hostfile "$HOSTFILE" \
+      --map-by "ppr:${RANKS}:node" \
+      --bind-to core \
+      --report-bindings hostname \
+      > "$OUTDIR/placement_${RANKS}.log" 2>&1
+done
+
+echo "=== Warm-up runs ==="
+
+for RANKS in 4 8 12; do
+    run_mpi "$RANKS" \
+      > "$OUTDIR/warmup_${RANKS}.log" 2>&1
+done
+
+echo "=== Five measurement rounds ==="
+
+for REP in 1 2 3 4 5; do
+
+    case "$REP" in
+        1|4) ORDER="4 8 12" ;;
+        2|5) ORDER="8 12 4" ;;
+        3)   ORDER="12 4 8" ;;
+    esac
+
+    for RANKS in $ORDER; do
+        echo "Measurement $REP, ranks=$RANKS"
+
+        run_mpi "$RANKS" \
+          > "$OUTDIR/r${RANKS}_rep${REP}.log" 2>&1
+
+        grep '^RESULT ' \
+          "$OUTDIR/r${RANKS}_rep${REP}.log"
+    done
+done
+
+python3 - "$OUTDIR" <<'PY'
+import csv
+import pathlib
+import statistics
+import sys
+
+out = pathlib.Path(sys.argv[1])
+rows = []
+summary = []
+
+fields = [
+    "variant", "points", "clusters", "dims",
+    "iterations", "ranks", "threads", "time_s",
+    "communication_s", "inertia", "accuracy",
+    "assignment_hash"
+]
+
+for ranks in (4, 8, 12):
+    results = []
+
+    for rep in range(1, 6):
+        path = out / "r{}_rep{}.log".format(ranks, rep)
+
+        lines = [
+            line for line in path.read_text(errors="replace").splitlines()
+            if line.startswith("RESULT ")
+        ]
+
+        if len(lines) != 1:
+            raise RuntimeError("Missing or duplicate RESULT: " + str(path))
+
+        values = dict(x.split("=", 1) for x in lines[0].split()[1:])
+
+        if (values["variant"] != "mpi" or
+            int(values["ranks"]) != ranks or
+            int(values["points"]) != ranks * 800000 or
+            int(values["clusters"]) != 8 or
+            int(values["dims"]) != 8 or
+            int(values["iterations"]) != 20 or
+            float(values["accuracy"]) < 0.999999):
+            raise RuntimeError("Invalid result: " + str(path))
+
+        rows.append({"source": str(path), **values})
+        results.append(values)
+
+    if len(set(r["assignment_hash"] for r in results)) != 1:
+        raise RuntimeError("Assignment hash mismatch for rank {}".format(ranks))
+
+    times = [float(r["time_s"]) for r in results]
+    comms = [float(r["communication_s"]) for r in results]
+
+    summary.append({
+        "ranks": ranks,
+        "points": ranks * 800000,
+        "median_s": statistics.median(times),
+        "min_s": min(times),
+        "max_s": max(times),
+        "mpi_percent": 100 * statistics.median(comms) / statistics.median(times)
+    })
+
+with (out / "results.csv").open("w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["source"] + fields)
+    writer.writeheader()
+    writer.writerows(rows)
+
+with (out / "summary.csv").open("w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=list(summary[0]))
+    writer.writeheader()
+    writer.writerows(summary)
+
+print("=== Controlled weak-scaling summary ===")
+for s in summary:
+    print(
+        "{} ranks: median {:.6f} s, MPI {:.2f}%".format(
+            s["ranks"], s["median_s"], s["mpi_percent"]
+        )
+    )
+
+print("VALIDATION PASSED: 15 measurements")
+print("Saved:", out / "results.csv")
+print("Saved:", out / "summary.csv")
+PY

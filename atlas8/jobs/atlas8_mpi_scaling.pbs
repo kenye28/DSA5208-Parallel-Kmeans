@@ -1,0 +1,101 @@
+#!/bin/bash
+#PBS -N km_scaling
+#PBS -q parallel
+#PBS -l place=scatter
+#PBS -l walltime=00:45:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+source scripts/atlas8_env.sh
+
+LIBSTDCPP=$(g++ -print-file-name=libstdc++.so.6)
+
+if [[ ! -f "$LIBSTDCPP" ]]; then
+    echo "ERROR: GCC C++ runtime not found" >&2
+    exit 1
+fi
+
+GCC_LIBDIR=$(dirname "$LIBSTDCPP")
+export LD_LIBRARY_PATH="$GCC_LIBDIR:${LD_LIBRARY_PATH:-}"
+
+# Choose dataset size
+if [[ "$MODE" == "strong" ]]; then
+    N=16000000
+elif [[ "$MODE" == "weak" ]]; then
+    N=$((RANKS * 800000))
+else
+    echo "ERROR: Invalid MODE"
+    exit 1
+fi
+
+# Create output directory
+OUTDIR="results/atlas8/scaling/${MODE}/${RANKS}_${PBS_JOBID%%.*}"
+mkdir -p "$OUTDIR"
+
+# Create MPI hostfile from PBS allocation
+HOSTFILE="$OUTDIR/mpi_hosts.txt"
+
+sort "$PBS_NODEFILE" | uniq -c |
+    awk '{printf "%s slots=%d\n", $2, $1}' > "$HOSTFILE"
+
+echo "=== Experiment ==="
+echo "Mode: $MODE"
+echo "MPI ranks: $RANKS"
+echo "Points: $N"
+
+echo "=== Allocated nodes ==="
+cat "$HOSTFILE"
+
+# Validate allocation
+SLOTS=$(wc -l < "$PBS_NODEFILE")
+
+if (( SLOTS < RANKS )); then
+    echo "ERROR: Insufficient allocated slots"
+    exit 1
+fi
+
+ARGS=(--points "$N" --clusters 8 --dims 8 \
+      --iterations 20 --seed 1234)
+
+# Serial baseline: only for 12-core strong scaling
+if [[ "$MODE" == "strong" && "$RANKS" == "12" ]]; then
+    echo "=== Serial baseline ==="
+
+    ./bin/serial "${ARGS[@]}" > /dev/null
+
+    for rep in 1 2 3 4 5; do
+        ./bin/serial "${ARGS[@]}" \
+            >> "$OUTDIR/serial.log"
+    done
+fi
+
+# MPI command with correct Open MPI prefix
+run_mpi() {
+    mpiexec \
+        --prefix /app1/centos7/gnu/openmpi-4.1.2_install \
+        --hostfile "$HOSTFILE" \
+        --map-by slot \
+        --bind-to core \
+        -x LD_LIBRARY_PATH \
+        -np "$RANKS" \
+        ./bin/mpi "${ARGS[@]}"
+}
+
+echo "=== MPI warm-up ==="
+run_mpi > /dev/null
+
+echo "=== MPI measurements ==="
+
+for rep in 1 2 3 4 5; do
+    echo "Measurement $rep"
+
+    run_mpi | tee -a "$OUTDIR/mpi.log"
+done
+
+# Generate CSV results
+python3 scripts/parse_results.py \
+    "$OUTDIR"/*.log > "$OUTDIR/results.csv"
+
+echo "Saved: $OUTDIR/results.csv"

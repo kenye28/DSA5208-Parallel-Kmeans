@@ -1,0 +1,94 @@
+#!/bin/bash -l
+#PBS -N km_gpu16m
+#PBS -q auto
+#PBS -P personal-zhengkai.ye
+#PBS -l select=1:ncpus=4:ngpus=1:mem=16gb
+#PBS -l walltime=00:30:00
+#PBS -j oe
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+module load gcc/13.1.0
+module load cuda12.4/toolkit/12.4.1
+
+OUT="results/vanda/gpu_benchmark16m/${PBS_JOBID%%.*}"
+mkdir -p "$(dirname "$OUT")"
+mkdir "$OUT"
+nvidia-smi -L | tee "$OUT/gpu.txt"
+
+args=(--points 16000000 --clusters 8 --dims 8 --iterations 20 --seed 1234)
+
+echo '=== CPU and GPU warm-ups (not measured) ==='
+./bin/serial "${args[@]}" > "$OUT/serial_warmup.log"
+./bin/kmeans_cuda "${args[@]}" > "$OUT/cuda_warmup.log"
+
+run_cpu() { ./bin/serial "${args[@]}" | tee -a "$OUT/serial.log"; }
+run_gpu() { ./bin/kmeans_cuda "${args[@]}" | tee -a "$OUT/cuda.log"; }
+
+echo '=== Five measured repetitions, alternating order ==='
+for rep in 1 2 3 4 5; do
+  echo "Measurement $rep"
+  if (( rep % 2 == 1 )); then
+    run_cpu
+    run_gpu
+  else
+    run_gpu
+    run_cpu
+  fi
+done
+
+python3 - "$OUT" <<'PY'
+import csv
+import math
+import os
+import statistics
+import sys
+
+out = sys.argv[1]
+
+def rows_from(path, prefix):
+    rows = []
+    with open(path) as file:
+        for line in file:
+            if line.startswith(prefix + ' '):
+                rows.append(dict(part.split('=', 1) for part in line.split()[1:]))
+    return rows
+
+cpu = rows_from(os.path.join(out, 'serial.log'), 'RESULT')
+gpu = rows_from(os.path.join(out, 'cuda.log'), 'RESULT')
+timing = rows_from(os.path.join(out, 'cuda.log'), 'GPU_TIMING')
+assert len(cpu) == len(gpu) == len(timing) == 5, 'Expected five results per configuration'
+assert all(row['variant'] == 'serial' for row in cpu)
+assert all(row['variant'] == 'cuda' for row in gpu)
+for group in (cpu, gpu):
+    assert len({row['assignment_hash'] for row in group}) == 1, 'Inconsistent assignment hash'
+    assert all(int(row['points']) == 16000000 and int(row['iterations']) == 20 for row in group)
+    assert all(float(row['accuracy']) >= 0.999999 for row in group)
+assert cpu[0]['assignment_hash'] == gpu[0]['assignment_hash'], 'CPU/GPU assignments differ'
+assert math.isclose(float(cpu[0]['inertia']), float(gpu[0]['inertia']), rel_tol=1e-6, abs_tol=1e-4), 'Inertia mismatch'
+
+fields = ['variant', 'points', 'clusters', 'dims', 'iterations', 'ranks', 'threads',
+          'time_s', 'communication_s', 'inertia', 'accuracy', 'assignment_hash']
+with open(os.path.join(out, 'results.csv'), 'w', newline='') as file:
+    writer = csv.DictWriter(file, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows([{key: row[key] for key in fields} for row in cpu + gpu])
+
+cpu_med = statistics.median(float(row['time_s']) for row in cpu)
+gpu_med = statistics.median(float(row['kernel_loop_s']) for row in timing)
+gpu_xfer_med = statistics.median(float(row['kernel_plus_transfers_s']) for row in timing)
+with open(os.path.join(out, 'timing.csv'), 'w', newline='') as file:
+    writer = csv.DictWriter(file, fieldnames=['run', 'kernel_loop_s', 'h2d_s', 'd2h_s', 'kernel_plus_transfers_s', 'cpu_score_s'])
+    writer.writeheader()
+    for i, row in enumerate(timing, 1):
+        writer.writerow({'run': i, **{field: row[field] for field in writer.fieldnames if field != 'run'}})
+
+print('VALIDATION PASSED: 16M points; five CPU and five CUDA runs')
+print('CPU median iterative_s:', format(cpu_med, '.6f'))
+print('GPU median kernel_loop_s:', format(gpu_med, '.6f'))
+print('GPU median kernel_plus_transfers_s:', format(gpu_xfer_med, '.6f'))
+print('Kernel-only speedup:', format(cpu_med / gpu_med, '.2f') + 'x')
+print('Transfer-inclusive speedup:', format(cpu_med / gpu_xfer_med, '.2f') + 'x')
+print('Saved:', os.path.join(out, 'results.csv'))
+print('Saved:', os.path.join(out, 'timing.csv'))
+PY

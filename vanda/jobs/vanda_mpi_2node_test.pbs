@@ -1,0 +1,40 @@
+#!/bin/bash -l
+#PBS -N km_2node_test
+#PBS -q auto
+#PBS -P personal-zhengkai.ye
+#PBS -l select=2:ncpus=1:mpiprocs=1:mem=2gb
+#PBS -l place=scatter
+#PBS -l walltime=00:10:00
+#PBS -j oe
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+module load gcc/13.1.0
+module load openmpi/gcc/64/4.1.8
+
+OUTDIR="results/vanda/inter_node_test/${PBS_JOBID%%.*}"
+mkdir -p "$OUTDIR"
+
+sort "$PBS_NODEFILE" | uniq -c | \
+  awk '{print $2 " slots=" $1}' > "$OUTDIR/hosts.txt"
+
+echo "=== Allocated hosts ==="
+cat "$OUTDIR/hosts.txt"
+
+echo "=== Running two-node MPI test ==="
+
+mpiexec -np 2 \
+  --hostfile "$OUTDIR/hosts.txt" \
+  --map-by ppr:1:node \
+  --bind-to core \
+  ./bin/mpi \
+  --points 200000 \
+  --clusters 8 \
+  --dims 8 \
+  --iterations 20 \
+  --seed 1234 \
+  | tee "$OUTDIR/mpi.log"
+
+echo "=== Two-node MPI test completed ==="
