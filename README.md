@@ -99,6 +99,5 @@ The timing results in the final coursework report distinguish CPU iteration time
 
 ## Notes
 
-- This repository intentionally omits the coursework report, plots, and benchmark CSV archives.
 - Run results can depend on CPU node type, rank binding, memory bandwidth, network and allocation conditions.
 - A verified 256-rank K-means execution is not, on its own, a matched 256-core strong- or weak-scaling efficiency measurement.
