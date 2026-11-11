@@ -1,0 +1,100 @@
+#!/bin/bash -l
+#PBS -N km_s256
+#PBS -q auto
+#PBS -P personal-zhengkai.ye
+#PBS -l select=4:ncpus=64:mpiprocs=64:mem=16gb
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+module load gcc/13.1.0
+module load openmpi/gcc/64/4.1.8
+
+PREFIX=/cm/shared/apps/openmpi4/gcc/4.1.8
+NP=256
+N=64000000
+OUT="results/vanda/strong_scaling/256_${PBS_JOBID%%.*}"
+mkdir -p "$OUT"
+
+sort "$PBS_NODEFILE" | uniq -c | awk '{print $2 " slots=" $1}' > "$OUT/hosts.txt"
+cat "$OUT/hosts.txt"
+
+if [[ $(wc -l < "$PBS_NODEFILE") -ne 256 || $(wc -l < "$OUT/hosts.txt") -ne 4 ]]; then
+    echo "ERROR: Expected 256 PBS slots across 4 distinct nodes" >&2
+    exit 1
+fi
+
+# Confirm each node exposes at least 64 physical cores, without SMT.
+mpiexec --prefix "$PREFIX" --hostfile "$OUT/hosts.txt" \
+    -np 4 --map-by ppr:1:node --bind-to core \
+    python3 -c 'import socket,subprocess
+lines=subprocess.check_output(["lscpu","-p=CPU,CORE,SOCKET"]).decode().splitlines()
+rows=[s.split(",") for s in lines if s and not s.startswith("#")]
+physical={(r[1],r[2]) for r in rows}
+print("TOPOLOGY", socket.gethostname().split(".")[0].lower(), len(rows), len(physical), flush=True)
+assert len(physical)>=64 and len(rows)==len(physical), "Not >=64 physical cores with SMT disabled"' \
+    > "$OUT/topology.txt"
+cat "$OUT/topology.txt"
+
+# Prove that 256 MPI processes have one distinct bound CPU each.
+mpiexec --prefix "$PREFIX" --hostfile "$OUT/hosts.txt" \
+    -np 256 --map-by ppr:64:node --bind-to core \
+    python3 -c 'import os,socket
+print("AFFINITY",socket.gethostname().split(".")[0].lower(), ",".join(map(str,sorted(os.sched_getaffinity(0)))),flush=True)' \
+    > "$OUT/affinity.txt"
+
+python3 - "$OUT/affinity.txt" <<'PY'
+import collections,sys
+by_host=collections.defaultdict(list)
+for line in open(sys.argv[1]):
+    parts=line.split()
+    if len(parts)!=3 or parts[0]!="AFFINITY":
+        raise SystemExit("Unexpected affinity entry: "+line)
+    cpus=parts[2].split(",")
+    if len(cpus)!=1:
+        raise SystemExit("Rank not bound to one logical CPU: "+line)
+    by_host[parts[1]].append(int(cpus[0]))
+if len(by_host)!=4:
+    raise SystemExit("Expected 4 hosts, found "+str(len(by_host)))
+for host,cpus in sorted(by_host.items()):
+    if len(cpus)!=64 or len(set(cpus))!=64:
+        raise SystemExit("Insufficient distinct bound cores on "+host)
+    print("VERIFIED",host,"64 ranks bound to 64 distinct CPUs")
+print("VERIFIED 256 distinct rank-to-CPU bindings across 4 nodes")
+PY
+
+run_mpi() {
+    mpiexec --prefix "$PREFIX" --hostfile "$OUT/hosts.txt" \
+        -np "$NP" --map-by ppr:64:node --bind-to core \
+        ./bin/mpi --points "$N" --clusters 8 --dims 8 \
+        --iterations 20 --seed 1234
+}
+
+echo "=== Warm-up: $N points / $NP ranks ==="
+run_mpi >/dev/null 2>>"$OUT/mpi_stderr.log"
+
+echo "=== Five timed repetitions ==="
+for rep in 1 2 3 4 5; do
+    echo "Measurement $rep"
+    run_mpi 2>>"$OUT/mpi_stderr.log" | tee -a "$OUT/mpi.log"
+done
+
+python3 - "$OUT/mpi.log" "$OUT/results.csv" <<'PY'
+import csv,statistics,sys
+fields=["variant","points","clusters","dims","iterations","ranks","threads","time_s","communication_s","inertia","accuracy","assignment_hash"]
+rows=[]
+for line in open(sys.argv[1]):
+    if line.startswith("RESULT "):
+        rows.append(dict(x.split("=",1) for x in line.split()[1:]))
+if len(rows)!=5 or any(int(r["ranks"])!=256 or int(r["points"])!=64000000 or float(r["accuracy"])<0.999999 for r in rows):
+    raise SystemExit("ERROR: Missing measurements or incorrect rank/accuracy")
+if len({r["assignment_hash"] for r in rows})!=1:
+    raise SystemExit("ERROR: Assignment hashes differ")
+with open(sys.argv[2],"w",newline="") as f:
+    writer=csv.DictWriter(f,fieldnames=["source"]+fields)
+    writer.writeheader()
+    for row in rows: writer.writerow({"source":sys.argv[1],**row})
+print("SAVED",sys.argv[2],"median_s",statistics.median(float(r["time_s"]) for r in rows))
+PY
